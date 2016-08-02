@@ -2,28 +2,36 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/codegangsta/cli"
-	"github.com/hashicorp/consul/api"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"time"
+	"unicode/utf8"
+
+	"github.com/hashicorp/consul/api"
+	"gopkg.in/urfave/cli.v1" // imports as package "cli"
 )
 
-type KVJson struct {
-	BackupDate time.Time         `json:"date"`
-	Connection map[string]string `json:"connection_info"`
-	Values     map[string]string `json:"values"`
+type valueEnc struct {
+	Encoding string `json:"encoding,omitempty"`
+	Str      string `json:"value"`
+}
+
+type kvJSON struct {
+	BackupDate time.Time           `json:"date"`
+	Connection map[string]string   `json:"connection_info"`
+	Values     map[string]valueEnc `json:"values"`
 }
 
 func main() {
 	app := cli.NewApp()
 	app.Name = "kv-backup"
 	app.Usage = "Back up Consul's KV store"
-	app.Version = "0.1"
+	app.Version = "0.2"
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:   "cacert,r",
@@ -85,7 +93,7 @@ func main() {
 		{
 			Name:   "backup",
 			Usage:  "Dump Consul's KV database to a JSON file",
-			Action: Backup,
+			Action: backup,
 			Flags: []cli.Flag{
 				cli.StringFlag{
 					Name:   "outfile,o",
@@ -101,10 +109,12 @@ func main() {
 		},
 	}
 
-	app.Run(os.Args)
+	if err := app.Run(os.Args); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func getConnectionFromFlags(c *cli.Context) (client *api.Client, bkup *KVJson, err error) {
+func getConnectionFromFlags(c *cli.Context) (client *api.Client, bkup *kvJSON, err error) {
 	// Start with the default Consul API config
 	config := api.DefaultConfig()
 
@@ -116,7 +126,7 @@ func getConnectionFromFlags(c *cli.Context) (client *api.Client, bkup *KVJson, e
 	config.Address = fmt.Sprintf("%s:%v", c.GlobalString("addr"), c.GlobalInt("port"))
 
 	// Populate backup metadata
-	bkup = &KVJson{
+	bkup = &kvJSON{
 		BackupDate: time.Now(),
 		Connection: map[string]string{},
 	}
@@ -141,7 +151,8 @@ func getConnectionFromFlags(c *cli.Context) (client *api.Client, bkup *KVJson, e
 		bkup.Connection["key"] = c.GlobalString("key")
 
 		// Load cert and key files
-		cert, err := tls.LoadX509KeyPair(c.GlobalString("cert"), c.GlobalString("key"))
+		var cert tls.Certificate
+		cert, err = tls.LoadX509KeyPair(c.GlobalString("cert"), c.GlobalString("key"))
 		if err != nil {
 			log.Fatalf("Could not load cert: %v", err)
 		}
@@ -183,7 +194,7 @@ func getConnectionFromFlags(c *cli.Context) (client *api.Client, bkup *KVJson, e
 	return
 }
 
-func dumpOutput(path string, bkup *KVJson) {
+func dumpOutput(path string, bkup *kvJSON) {
 	if len(path) > 0 {
 		outBytes, err := json.Marshal(bkup)
 		if err != nil {
@@ -201,7 +212,7 @@ func dumpOutput(path string, bkup *KVJson) {
 	}
 }
 
-func readBackupFile(path string) (bkup *KVJson, err error) {
+func readBackupFile(path string) (bkup *kvJSON, err error) {
 	var f *os.File
 	f, err = os.Open(path)
 	defer f.Close()
@@ -216,51 +227,74 @@ func readBackupFile(path string) (bkup *KVJson, err error) {
 	return
 }
 
-func Backup(c *cli.Context) {
+func backup(c *cli.Context) (err error) {
 	// Get KV client
 	client, backupResult, err := getConnectionFromFlags(c)
 	if err != nil {
-		log.Fatalf("%v", err)
+		return
 	}
 	kv := client.KV()
 
 	// Dump all
 	pairs, _, err := kv.List(c.GlobalString("prefix"), &api.QueryOptions{})
 	if err != nil {
-		log.Fatalf("%v", err)
+		return
 	}
-	bkup := map[string]string{}
+	bkup := map[string]valueEnc{}
 	for _, p := range pairs {
-		bkup[p.Key] = string(p.Value)
+		validUtf8 := utf8.Valid(p.Value)
+		if validUtf8 {
+			bkup[p.Key] = valueEnc{"", string(p.Value)}
+		} else {
+			sEnc := base64.StdEncoding.EncodeToString(p.Value)
+			bkup[p.Key] = valueEnc{"base64", sEnc}
+		}
 	}
 	backupResult.Values = bkup
 
 	// Send results to outfile (if defined) or stdout
 	dumpOutput(c.String("outfile"), backupResult)
+
+	return
 }
 
-func restore(c *cli.Context) {
+func restore(c *cli.Context) (err error) {
 	// Get KV client
 	client, _, err := getConnectionFromFlags(c)
 	if err != nil {
-		log.Fatalf("%v", err)
+		return
 	}
 	kv := client.KV()
 
 	// Get backup JSON from file
 	bkup, err := readBackupFile(c.Args().First())
 	if err != nil {
-		log.Fatal("Error getting data: ", err)
+		return fmt.Errorf("Error getting data: %v", err)
 	}
 
 	// restore file contents
-	for k, v := range bkup.Values {
-		log.Printf("Restoring key '%s' to '%s'", k, v)
+	var v string
+	for k, ve := range bkup.Values {
+		switch ve.Encoding {
+		case "base64":
+			vd, err := base64.StdEncoding.DecodeString(ve.Str)
+			if err != nil {
+				return fmt.Errorf("Error decoding the value of key '%s': %v", k, err)
+			}
+			v = string(vd)
+		case "utf8", "":
+			v = ve.Str
+		default:
+			return fmt.Errorf("Unknown encoding '%v' for key '%s'", ve.Encoding, k)
+		}
+
+		log.Printf("Restoring key '%s'", k)
 		if _, err := kv.Put(&api.KVPair{
 			Key:   k,
 			Value: []byte(v),
 		}, &api.WriteOptions{}); err != nil {
-			log.Fatalf("Error writing key %s: %v", k, err)
+			return fmt.Errorf("Error writing key %s: %v", k, err)
 		}
 	}
+	return
 }
