@@ -4,13 +4,14 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"github.com/codegangsta/cli"
-	"github.com/hashicorp/consul/api"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/hashicorp/consul/api"
+	"gopkg.in/urfave/cli.v1" // imports as package "cli"
 )
 
 type KVJson struct {
@@ -85,7 +86,7 @@ func main() {
 		{
 			Name:   "backup",
 			Usage:  "Dump Consul's KV database to a JSON file",
-			Action: Backup,
+			Action: backup,
 			Flags: []cli.Flag{
 				cli.StringFlag{
 					Name:   "outfile,o",
@@ -216,18 +217,18 @@ func readBackupFile(path string) (bkup *KVJson, err error) {
 	return
 }
 
-func Backup(c *cli.Context) {
+func backup(c *cli.Context) (err error) {
 	// Get KV client
 	client, backupResult, err := getConnectionFromFlags(c)
 	if err != nil {
-		log.Fatalf("%v", err)
+		return
 	}
 	kv := client.KV()
 
 	// Dump all
 	pairs, _, err := kv.List(c.GlobalString("prefix"), &api.QueryOptions{})
 	if err != nil {
-		log.Fatalf("%v", err)
+		return
 	}
 	bkup := map[string]string{}
 	for _, p := range pairs {
@@ -237,20 +238,22 @@ func Backup(c *cli.Context) {
 
 	// Send results to outfile (if defined) or stdout
 	dumpOutput(c.String("outfile"), backupResult)
+
+	return
 }
 
-func restore(c *cli.Context) {
+func restore(c *cli.Context) (err error) {
 	// Get KV client
 	client, _, err := getConnectionFromFlags(c)
 	if err != nil {
-		log.Fatalf("%v", err)
+		return
 	}
 	kv := client.KV()
 
 	// Get backup JSON from file
 	bkup, err := readBackupFile(c.Args().First())
 	if err != nil {
-		log.Fatal("Error getting data: ", err)
+		return fmt.Errorf("Error getting data: %v", err)
 	}
 
 	// restore file contents
@@ -260,7 +263,8 @@ func restore(c *cli.Context) {
 			Key:   k,
 			Value: []byte(v),
 		}, &api.WriteOptions{}); err != nil {
-			log.Fatalf("Error writing key %s: %v", k, err)
+			return fmt.Errorf("Error writing key %s: %v", k, err)
 		}
 	}
+	return
 }
